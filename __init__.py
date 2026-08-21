@@ -371,6 +371,8 @@ def make_override(tau=1.0, min_tokens=4096,
                   dense_blocks=frozenset(), tau_profile=None, int8_pv=True,
                   local_blocks=1, exact_audio_queries=True,
                   int8_scope="distant",
+                  int8_dense_blocks=frozenset(),
+                  int8_start=None, int8_end=None,
                   coordinate_routing=True, temporal_radius=1, landmark_stride=4,
                   backend="sol_sparse", sol_blocks=frozenset(), sage_blocks=frozenset(),
                   previous=None):
@@ -398,7 +400,7 @@ def make_override(tau=1.0, min_tokens=4096,
         # sparsification varies several-fold across depth, so a block can be kept
         # dense outright or given its own tau.
         block = None
-        if dense_blocks or tau_profile or backend == "tri_policy":
+        if dense_blocks or int8_dense_blocks or tau_profile or backend == "tri_policy":
             block = kwargs.get("transformer_options", {}).get("sol_block")
         if block in dense_blocks:
             _stats["dense_block"] += 1
@@ -426,6 +428,20 @@ def make_override(tau=1.0, min_tokens=4096,
                     _stats["outside_range"] += 1
                     return dense()
 
+        # INT8 is the main speed path, but a small number of video-model
+        # layers and denoise endpoints can amplify a one-frame routing error
+        # into hand/face ghosts.  Keep Sol routing enabled there while making
+        # only its QK/PV arithmetic BF16.  This is deliberately independent
+        # of dense_blocks: it retains most of the sparse-attention speed.
+        use_int8 = int8_qk and block not in int8_dense_blocks
+        sigmas = kwargs.get("transformer_options", {}).get("sigmas")
+        if use_int8 and sigmas is not None and (int8_start is not None or int8_end is not None):
+            sigma = float(sigmas[0])
+            if (int8_start is not None and sigma > int8_start) or \
+               (int8_end is not None and sigma < int8_end):
+                use_int8 = False
+                _stats["int8_safety_fallback"] = _stats.get("int8_safety_fallback", 0) + 1
+
         tokens = q.shape[2] if skip_reshape else q.shape[1]
         sink, sink_q = _sink_blocks(kwargs.get("transformer_options"), tokens,
                                     sink_conditioning)
@@ -444,7 +460,7 @@ def make_override(tau=1.0, min_tokens=4096,
             else:
                 out = _run(q, k, v, heads, skip_reshape, skip_output_reshape,
                            kwargs.get("scale", None), block_tau,
-                           min_tokens, verbose, int8_qk, sink, sink_q, use_tma,
+                           min_tokens, verbose, use_int8, sink, sink_q, use_tma,
                            int8_pv, local_blocks, int8_scope, protected)
         except Exception as exc:
             _stats["errors"] += 1
@@ -675,6 +691,17 @@ class SolAttnVideoPatch(io.ComfyNode):
                                        "temporal radius in BF16, using INT8 only for routed "
                                        "long-range blocks. On RTX 4090 this retains 97% of the "
                                        "all-INT8 speed and is the safer H3 default."),
+                io.String.Input("int8_dense_blocks", default="",
+                                tooltip="Video safety: use BF16 QK/PV only in these transformer "
+                                        "blocks while retaining Sol sparse routing, e.g. '0-3,36-39'. "
+                                        "This targets hand/face ghosting with much less cost than "
+                                        "putting the blocks in dense_blocks."),
+                io.Float.Input("int8_start_percent", default=0.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Video safety: keep INT8 off before this denoise percentage; "
+                                       "Sol routing remains enabled. 0 means no initial BF16 window."),
+                io.Float.Input("int8_end_percent", default=1.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Video safety: keep INT8 off after this denoise percentage; "
+                                       "1 means no final BF16 window."),
                 io.Boolean.Input("coordinate_routing", default=True,
                                  tooltip="MiniMax-H3: protect complete current/neighbor video "
                                          "frames using the true packed (t,h,w) layout. Sequence "
@@ -700,6 +727,7 @@ class SolAttnVideoPatch(io.ComfyNode):
                 tau_profile=None, use_tma=False, int8_pv=True,
                 local_blocks=1, exact_audio_queries=True,
                 int8_scope="distant", coordinate_routing=True,
+                int8_dense_blocks="", int8_start_percent=0.0, int8_end_percent=1.0,
                 temporal_radius=1, landmark_stride=4,
                 backend="sol_sparse", sol_blocks="12-18,20-22",
                 sage_blocks="3-11,19,23-38,40-45") -> io.NodeOutput:
@@ -734,20 +762,23 @@ class SolAttnVideoPatch(io.ComfyNode):
         blocks = getattr(diffusion_model, "blocks", None)
         count = len(blocks) if blocks is not None else 0
         dense = parse_blocks(dense_blocks, count)
+        int8_safe = parse_blocks(int8_dense_blocks, count)
         sol_selected = parse_blocks(sol_blocks, count) if backend == "tri_policy" else frozenset()
         sage_selected = parse_blocks(sage_blocks, count) if backend == "tri_policy" else frozenset()
         overlap = sol_selected & sage_selected
         if overlap:
             raise ValueError(f"tri_policy sol_blocks and sage_blocks overlap: {sorted(overlap)}")
         profile = parse_tau_profile(tau_profile or "", count)
-        if (dense or profile or backend == "tri_policy") and not _install_block_index(diffusion_model):
+        if (dense or int8_safe or profile or backend == "tri_policy") and not _install_block_index(diffusion_model):
             logging.warning(
-                f"[sol_attn] dense_blocks/tau_profile ignored: "
+                f"[sol_attn] per-block Sol policy ignored: "
                 f"{type(diffusion_model).__name__} has no .blocks list to index")
             dense, profile = frozenset(), {}
             sol_selected, sage_selected = frozenset(), frozenset()
         if dense:
             logging.info(f"[sol_attn] keeping blocks {sorted(dense)} dense of {count}")
+        if int8_safe:
+            logging.info(f"[sol_attn] keeping INT8 off for blocks {sorted(int8_safe)} of {count}")
         if profile:
             levels = {}
             for block, level in sorted(profile.items()):
@@ -805,6 +836,11 @@ class SolAttnVideoPatch(io.ComfyNode):
                           local_blocks=local_blocks,
                           exact_audio_queries=exact_audio_queries,
                           int8_scope=int8_scope,
+                          int8_dense_blocks=int8_safe,
+                          int8_start=float(model_sampling.percent_to_sigma(int8_start_percent))
+                          if int8_start_percent > 0.0 else None,
+                          int8_end=float(model_sampling.percent_to_sigma(int8_end_percent))
+                          if int8_end_percent < 1.0 else None,
                           coordinate_routing=coordinate_routing,
                           temporal_radius=temporal_radius,
                           landmark_stride=landmark_stride,
