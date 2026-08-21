@@ -904,5 +904,5 @@ class SolAttnVideoExtension(ComfyExtension):
         return [SolAttnVideoPatch, SolAttnVideoBlockProbe]
 
 
-async def comfy_entrypoint() -> SolAttnExtension:
+async def comfy_entrypoint() -> SolAttnVideoExtension:
     return SolAttnVideoExtension()
