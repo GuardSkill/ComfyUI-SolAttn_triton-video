@@ -8,3 +8,9 @@ This package is separate from upstream `ComfyUI-SolAttn_triton` and exposes
 
 It contains long-sequence routing, optional Morton frame ordering, video/audio
 conditioning safeguards, tri-policy Sol/Sage dispatch, and distant INT8 QK/PV.
+
+## Example workflow
+
+- [`SCAIL2_720P_accelerated.json`](example_workflows/SCAIL2_720P_accelerated.json) —
+  SCAIL2 720P video workflow using Sage/Sol layer dispatch and the warm-model
+  soft VRAM cleanup node.
