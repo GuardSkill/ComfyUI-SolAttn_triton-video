@@ -5,6 +5,7 @@ model, keeping the patch per-model and giving it the sigma schedule for dense
 warm-up steps. ``SOL_ATTN=1`` installs a global override for CLI benchmarks.
 """
 
+import gc
 import logging
 import os
 import os
@@ -906,6 +907,60 @@ class SolAttnVideoBlockProbe(io.ComfyNode):
         return io.NodeOutput(m)
 
 
+class SolAttnVideoSoftCleanup(io.ComfyNode):
+    """Release dead CUDA allocations without evicting resident models.
+
+    This is intentionally different from ComfyUI's full model-unload nodes. It
+    is meant for repeated, fixed-model video jobs where keeping the diffusion
+    model, LoRA patches, and compiled Triton kernels warm is important.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SolAttnVideoSoftCleanup",
+            display_name="Sol-Attn Video Soft VRAM Cleanup",
+            category="sol_attn",
+            description="Run after the final save node. Frees unreferenced CUDA "
+                        "cache while keeping ComfyUI models and compiled Sol kernels "
+                        "resident for the next warm request.",
+            is_output_node=True,
+            inputs=[io.AnyType.Input("anything")],
+            outputs=[io.AnyType.Output("output")],
+        )
+
+    @classmethod
+    def execute(cls, anything) -> io.NodeOutput:
+        before_allocated = 0
+        before_reserved = 0
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            before_allocated = torch.cuda.memory_allocated()
+            before_reserved = torch.cuda.memory_reserved()
+
+        gc.collect()
+        try:
+            import comfy.model_management as model_management
+            # force=False is essential: discard allocator cache, but do not
+            # unload the diffusion model or its LoRA/model-patcher clones.
+            model_management.soft_empty_cache(force=False)
+        except Exception as exc:
+            logging.warning("[sol_attn] soft VRAM cleanup fallback: %s", exc)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if torch.cuda.is_available():
+            after_allocated = torch.cuda.memory_allocated()
+            after_reserved = torch.cuda.memory_reserved()
+            logging.info(
+                "[sol_attn] soft VRAM cleanup: allocated %.1f -> %.1f MiB, "
+                "reserved %.1f -> %.1f MiB; resident models retained",
+                before_allocated / (1 << 20), after_allocated / (1 << 20),
+                before_reserved / (1 << 20), after_reserved / (1 << 20),
+            )
+        return io.NodeOutput(anything)
+
+
 @wrap_attn
 def attention_sol(q, k, v, heads, mask=None, attn_precision=None,
                   skip_reshape=False, skip_output_reshape=False, **kwargs):
@@ -937,7 +992,8 @@ if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
 
 class SolAttnVideoExtension(ComfyExtension):
     async def get_node_list(self):
-        return [SolAttnVideoPatch, SolAttnVideoBlockProbe]
+        return [SolAttnVideoPatch, SolAttnVideoBlockProbe,
+                SolAttnVideoSoftCleanup]
 
 
 async def comfy_entrypoint() -> SolAttnVideoExtension:
