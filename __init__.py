@@ -961,6 +961,91 @@ class SolAttnVideoSoftCleanup(io.ComfyNode):
         return io.NodeOutput(anything)
 
 
+class SageAttentionVideoSM89Patch(io.ComfyNode):
+    """Exact dense SageAttention specialization for long D=128 video tokens."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SageAttentionVideoSM89Patch",
+            display_name="SageAttention Video SM89 Four-Tile",
+            category="sol_attn",
+            description="RTX 4090 dense SageAttention four-V-tile kernel for long "
+                        "Wan/SCAIL2 video sequences. This is an exact dense path: "
+                        "it does not use Sol sparsity or distant INT8 PV.",
+            inputs=[io.Model.Input("model")],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model) -> io.NodeOutput:
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9):
+            raise RuntimeError("SageAttention Video SM89 requires an RTX 4090-class SM89 GPU")
+        try:
+            from h3_sage_sm89_backend import attention as four_tile_attention
+        except Exception as exc:
+            raise RuntimeError(
+                "The SM89 four-tile backend is not installed in this ComfyUI environment"
+            ) from exc
+
+        @wrap_attn
+        def attention_video_sm89(
+            q, k, v, heads, mask=None, attn_precision=None,
+            skip_reshape=False, skip_output_reshape=False, **kwargs,
+        ):
+            if mask is not None or kwargs.get("low_precision_attention", True) is False:
+                return attention_pytorch(
+                    q, k, v, heads, mask=mask,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape, **kwargs,
+                )
+            output_dtype = v.dtype
+            if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
+                q, k, v = q.half(), k.half(), v.half()
+            if skip_reshape:
+                batch, _, _, dim_head = q.shape
+                layout = "HND"
+            else:
+                batch, _, width = q.shape
+                dim_head = width // heads
+                if dim_head != 128:
+                    return attention_pytorch(
+                        q, k, v, heads, mask=mask, skip_reshape=False,
+                        skip_output_reshape=skip_output_reshape, **kwargs,
+                    )
+                q, k, v = (
+                    value.view(batch, -1, heads, dim_head)
+                    for value in (q, k, v)
+                )
+                layout = "NHD"
+            if dim_head != 128:
+                return attention_pytorch(
+                    q, k, v, heads, mask=mask, skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape, **kwargs,
+                )
+            output = four_tile_attention(q, k, v, tensor_layout=layout).to(output_dtype)
+            if layout == "HND":
+                if not skip_output_reshape:
+                    output = output.transpose(1, 2).reshape(batch, -1, heads * dim_head)
+            elif skip_output_reshape:
+                output = output.transpose(1, 2)
+            else:
+                output = output.reshape(batch, -1, heads * dim_head)
+            return output
+
+        override = torch.compiler.disable()(attention_video_sm89)
+        patched = model.clone()
+
+        def attention_override(_func, *args, **kwargs):
+            return override.__wrapped__(*args, **kwargs)
+
+        patched.model_options.setdefault("transformer_options", {})[
+            "optimized_attention_override"
+        ] = attention_override
+        logging.info("[sol_attn] enabled exact dense SM89 four-tile video Sage backend")
+        return io.NodeOutput(patched)
+
+
 @wrap_attn
 def attention_sol(q, k, v, heads, mask=None, attn_precision=None,
                   skip_reshape=False, skip_output_reshape=False, **kwargs):
@@ -993,7 +1078,7 @@ if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
 class SolAttnVideoExtension(ComfyExtension):
     async def get_node_list(self):
         return [SolAttnVideoPatch, SolAttnVideoBlockProbe,
-                SolAttnVideoSoftCleanup]
+                SolAttnVideoSoftCleanup, SageAttentionVideoSM89Patch]
 
 
 async def comfy_entrypoint() -> SolAttnVideoExtension:
