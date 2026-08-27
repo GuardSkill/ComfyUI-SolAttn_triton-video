@@ -988,17 +988,33 @@ class SageAttentionVideoSM89Patch(io.ComfyNode):
                 "The SM89 four-tile backend is not installed in this ComfyUI environment"
             ) from exc
 
+        previous = model.model_options.setdefault("transformer_options", {}).get(
+            "optimized_attention_override"
+        )
+
         @wrap_attn
         def attention_video_sm89(
             q, k, v, heads, mask=None, attn_precision=None,
             skip_reshape=False, skip_output_reshape=False, **kwargs,
         ):
-            if mask is not None or kwargs.get("low_precision_attention", True) is False:
-                return attention_pytorch(
+            def dense():
+                target = attention_pytorch if previous is None else partial(
+                    previous, attention_pytorch
+                )
+                return target(
                     q, k, v, heads, mask=mask,
                     skip_reshape=skip_reshape,
                     skip_output_reshape=skip_output_reshape, **kwargs,
                 )
+
+            q_tokens = q.shape[2] if skip_reshape else q.shape[1]
+            k_tokens = k.shape[2] if skip_reshape else k.shape[1]
+            v_tokens = v.shape[2] if skip_reshape else v.shape[1]
+            if (mask is not None
+                    or kwargs.get("low_precision_attention", True) is False
+                    or q_tokens != k_tokens
+                    or q_tokens != v_tokens):
+                return dense()
             output_dtype = v.dtype
             if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
                 q, k, v = q.half(), k.half(), v.half()
@@ -1009,20 +1025,14 @@ class SageAttentionVideoSM89Patch(io.ComfyNode):
                 batch, _, width = q.shape
                 dim_head = width // heads
                 if dim_head != 128:
-                    return attention_pytorch(
-                        q, k, v, heads, mask=mask, skip_reshape=False,
-                        skip_output_reshape=skip_output_reshape, **kwargs,
-                    )
+                    return dense()
                 q, k, v = (
                     value.view(batch, -1, heads, dim_head)
                     for value in (q, k, v)
                 )
                 layout = "NHD"
             if dim_head != 128:
-                return attention_pytorch(
-                    q, k, v, heads, mask=mask, skip_reshape=skip_reshape,
-                    skip_output_reshape=skip_output_reshape, **kwargs,
-                )
+                return dense()
             output = four_tile_attention(q, k, v, tensor_layout=layout).to(output_dtype)
             if layout == "HND":
                 if not skip_output_reshape:
