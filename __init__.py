@@ -376,6 +376,7 @@ def make_override(tau=1.0, min_tokens=4096,
                   int8_start=None, int8_end=None,
                   coordinate_routing=True, temporal_radius=1, landmark_stride=4,
                   backend="sol_sparse", sol_blocks=frozenset(), sage_blocks=frozenset(),
+                  protected_provider=None,
                   previous=None):
     """Build an optimized_attention_override callable.
 
@@ -448,6 +449,21 @@ def make_override(tau=1.0, min_tokens=4096,
                                     sink_conditioning)
         protected = kwargs.get("transformer_options", {}).get("sol_h3_protected_blocks") \
             if coordinate_routing else None
+        if protected is None and protected_provider is not None:
+            protected = protected_provider(
+                kwargs.get("transformer_options", {}), tokens, q.device)
+            # Never silently run an unprotected sparse SCAIL call. A missing
+            # map means the pose/grid contract changed or the hook did not run;
+            # dense delegation is slower but cannot introduce motion ghosts.
+            if protected is None:
+                _stats["motion_map_fallback"] = _stats.get(
+                    "motion_map_fallback", 0) + 1
+                _log_once(
+                    ("scail_motion_map_unavailable", tokens),
+                    f"SCAIL motion map unavailable for {tokens} tokens; "
+                    "delegating this call to the exact dense backend",
+                )
+                return dense()
         if verbose and sink != (0, 0):
             _log_once((tokens, sink, sink_q),
                       f"conditioning sink: KV blocks {sink} exact, dense query blocks {sink_q}")
@@ -740,6 +756,17 @@ class SolAttnVideoPatch(io.ComfyNode):
         diffusion_model = model.get_model_object("diffusion_model")
         is_h3 = hasattr(diffusion_model, "rope_freqs") and hasattr(diffusion_model, "_forward")
         is_wan = hasattr(diffusion_model, "rope_encode") and hasattr(diffusion_model, "blocks")
+        scail_protection = None
+        has_scail_pose = any(
+            hasattr(diffusion_model, name)
+            for name in ("patch_embedding_pose", "pose_patch_embedding")
+        )
+        if is_wan and coordinate_routing and has_scail_pose:
+            from ._scail_motion import install_scail_motion_protection
+            scail_protection = install_scail_motion_protection(
+                diffusion_model, block_size=BLOCK_SIZE,
+                temporal_radius=temporal_radius,
+                landmark_stride=landmark_stride)
 
         # H3 publishes its segment layout from the same hooks Morton uses, so the
         # conditioning sink needs them installed even when reordering is off.
@@ -847,6 +874,7 @@ class SolAttnVideoPatch(io.ComfyNode):
                           landmark_stride=landmark_stride,
                           backend=backend, sol_blocks=sol_selected,
                           sage_blocks=sage_selected,
+                          protected_provider=scail_protection,
                           previous=previous)
         if is_h3 and coordinate_routing:
             m.model_options["transformer_options"]["sol_h3_coordinate_routing"] = True
@@ -964,6 +992,8 @@ class SolAttnVideoSoftCleanup(io.ComfyNode):
 class SageAttentionVideoSM89Patch(io.ComfyNode):
     """Exact dense SageAttention specialization for long D=128 video tokens."""
 
+    ENABLE_SHARED_KV = False
+
     @classmethod
     def define_schema(cls):
         return io.Schema(
@@ -982,7 +1012,10 @@ class SageAttentionVideoSM89Patch(io.ComfyNode):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9):
             raise RuntimeError("SageAttention Video SM89 requires an RTX 4090-class SM89 GPU")
         try:
-            from h3_sage_sm89_backend import attention as four_tile_attention
+            from h3_sage_sm89_backend import (
+                WanAnimate2SharedKVAttention,
+                attention as four_tile_attention,
+            )
         except Exception as exc:
             raise RuntimeError(
                 "The SM89 four-tile backend is not installed in this ComfyUI environment"
@@ -991,18 +1024,29 @@ class SageAttentionVideoSM89Patch(io.ComfyNode):
         previous = model.model_options.setdefault("transformer_options", {}).get(
             "optimized_attention_override"
         )
-
+        shared_pose_attention = (
+            WanAnimate2SharedKVAttention(
+                refresh_interval=getattr(cls, "SHARED_KV_REFRESH_INTERVAL", 0)
+            ) if cls.ENABLE_SHARED_KV else None
+        )
+        # WanAnimate2 emits one rectangular reference-frame call with
+        # KV=f_gen*hw before the reusable pose-tail calls with
+        # KV=(f_gen+1)*hw.  Merely testing K>Q would accidentally cache that
+        # first call.  Arm only after observing the exact +one-frame shape
+        # transition, then disarm when the backend completes the frame group.
+        pose_sequence = {"precursor": None, "kv_tokens": None}
         @wrap_attn
         def attention_video_sm89(
             q, k, v, heads, mask=None, attn_precision=None,
             skip_reshape=False, skip_output_reshape=False, **kwargs,
         ):
+            q_input, k_input, v_input = q, k, v
             def dense():
                 target = attention_pytorch if previous is None else partial(
                     previous, attention_pytorch
                 )
                 return target(
-                    q, k, v, heads, mask=mask,
+                    q_input, k_input, v_input, heads, mask=mask,
                     skip_reshape=skip_reshape,
                     skip_output_reshape=skip_output_reshape, **kwargs,
                 )
@@ -1012,8 +1056,7 @@ class SageAttentionVideoSM89Patch(io.ComfyNode):
             v_tokens = v.shape[2] if skip_reshape else v.shape[1]
             if (mask is not None
                     or kwargs.get("low_precision_attention", True) is False
-                    or q_tokens != k_tokens
-                    or q_tokens != v_tokens):
+                    or k_tokens != v_tokens):
                 return dense()
             output_dtype = v.dtype
             if q.dtype == torch.float32 or k.dtype == torch.float32 or v.dtype == torch.float32:
@@ -1033,7 +1076,58 @@ class SageAttentionVideoSM89Patch(io.ComfyNode):
                 layout = "NHD"
             if dim_head != 128:
                 return dense()
-            output = four_tile_attention(q, k, v, tensor_layout=layout).to(output_dtype)
+            if shared_pose_attention is not None and k_tokens > q_tokens:
+                _log_once(
+                    ("wananimate2_rectangular_shape", q_tokens, k_tokens, layout),
+                    f"WanAnimate2 rectangular attention observed: Q={q_tokens}, "
+                    f"KV={k_tokens}, layout={layout}, heads={heads}, D={dim_head}",
+                )
+            try:
+                if q_tokens == k_tokens:
+                    output = four_tile_attention(q, k, v, tensor_layout=layout)
+                elif shared_pose_attention is not None and layout == "NHD" and k_tokens > q_tokens:
+                    # WanAnimate2 frame j attends an immutable generation KV
+                    # prefix plus one mutable pose-frame tail. The cache keeps
+                    # only completed prefix tiles and rewrites the mixed
+                    # 64-token K block / 16-token V tile on every frame.
+                    shape = (batch, q_tokens, heads, dim_head, q.dtype, q.device)
+                    active_kv = pose_sequence["kv_tokens"]
+                    precursor = pose_sequence["precursor"]
+                    if active_kv == k_tokens:
+                        output = shared_pose_attention(q, k, v, tensor_layout=layout)
+                    elif (precursor is not None and precursor[0] == shape
+                          and k_tokens == precursor[1] + q_tokens):
+                        shared_pose_attention.reset()
+                        pose_sequence["kv_tokens"] = k_tokens
+                        output = shared_pose_attention(q, k, v, tensor_layout=layout)
+                    else:
+                        shared_pose_attention.reset()
+                        pose_sequence["precursor"] = (shape, k_tokens)
+                        pose_sequence["kv_tokens"] = None
+                        return dense()
+                    if shared_pose_attention.calls_in_group == 0:
+                        pose_sequence["precursor"] = None
+                        pose_sequence["kv_tokens"] = None
+                else:
+                    return dense()
+            except Exception as exc:
+                failure_key = ("wananimate2_shared_kv_fallback", type(exc).__name__, str(exc))
+                if failure_key not in _seen:
+                    _seen.add(failure_key)
+                    logging.exception(
+                        f"[sol_attn] shared-KV pose path fell back to the previous backend: {exc}"
+                    )
+                if shared_pose_attention is not None:
+                    shared_pose_attention.reset()
+                return dense()
+            output = output.to(output_dtype)
+            cache_stats = shared_pose_attention.stats() if shared_pose_attention is not None else None
+            if cache_stats is not None and cache_stats["tail_updates"] == 1:
+                _log_once(
+                    ("wananimate2_shared_kv_active", q_tokens, k_tokens),
+                    f"WanAnimate2 shared-KV active: {k_tokens - q_tokens} cached generation "
+                    f"tokens + {q_tokens} pose-tail tokens",
+                )
             if layout == "HND":
                 if not skip_output_reshape:
                     output = output.transpose(1, 2).reshape(batch, -1, heads * dim_head)
@@ -1052,7 +1146,312 @@ class SageAttentionVideoSM89Patch(io.ComfyNode):
         patched.model_options.setdefault("transformer_options", {})[
             "optimized_attention_override"
         ] = attention_override
-        logging.info("[sol_attn] enabled exact dense SM89 four-tile video Sage backend")
+        suffix = " plus experimental WanAnimate2 shared-KV" if cls.ENABLE_SHARED_KV else ""
+        logging.info(f"[sol_attn] enabled exact dense SM89 four-tile Sage{suffix}")
+        return io.NodeOutput(patched)
+
+
+class SCAIL2VideoFinalPoseQueryPrune(io.ComfyNode):
+    """Skip only the final SCAIL2 pose queries that the model discards.
+
+    The complete generation+pose K/V remains visible to generation queries.
+    This is therefore an exact dense optimization and does not introduce Sol
+    sparsity.  Keeping it in this package makes the production Four-Tile
+    workflow independent of the experimental SCAIL2 Kitchen node bundle.
+    """
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SCAIL2VideoFinalPoseQueryPrune",
+            display_name="SCAIL2 Video Exact Final Pose Query Prune",
+            category="sol_attn",
+            description="SM89-only exact final-block optimization: retain full "
+                        "generation+pose K/V and omit only discarded pose queries.",
+            inputs=[
+                io.Model.Input("model"),
+                io.Boolean.Input("enabled", default=True),
+            ],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model, enabled=True) -> io.NodeOutput:
+        if not enabled:
+            return io.NodeOutput(model)
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9):
+            raise RuntimeError("SCAIL2 final pose-query pruning currently requires SM89")
+
+        import comfy.model_management as model_management
+        from comfy.ldm.flux.math import apply_rope1
+        from comfy.ldm.wan.model import repeat_e
+        try:
+            from h3_sage_sm89_backend import attention as four_tile_attention
+        except Exception as exc:
+            raise RuntimeError(
+                "The SM89 four-tile backend is not installed in this ComfyUI environment"
+            ) from exc
+
+        patched = model.clone()
+        diffusion = patched.get_model_object("diffusion_model")
+        if type(diffusion).__name__ != "SCAIL2WanModel":
+            raise RuntimeError(
+                "Final pose-query pruning is valid only for SCAIL2WanModel; "
+                f"received {type(diffusion).__name__}"
+            )
+        blocks = getattr(diffusion, "blocks", None)
+        if not blocks:
+            raise RuntimeError("SCAIL2 transformer blocks were not found")
+        block = blocks[-1]
+        stock_forward = type(block).forward
+
+        def final_main_only(x, e, freqs, context, context_img_len=257,
+                            transformer_options={}, _block=block, _stock=stock_forward):
+            patches = transformer_options.get("patches", {})
+            # External block/attention patches may consume the otherwise-dead
+            # pose output, so preserve stock semantics when any are present.
+            if any(name in patches for name in ("attn1_patch", "attn2_patch", "double_block")):
+                return _stock(
+                    _block, x, e, freqs, context,
+                    context_img_len=context_img_len,
+                    transformer_options=transformer_options,
+                )
+            grid = transformer_options.get("grid_sizes")
+            if grid is None:
+                return _stock(
+                    _block, x, e, freqs, context,
+                    context_img_len=context_img_len,
+                    transformer_options=transformer_options,
+                )
+            main_tokens = 1
+            for extent in grid:
+                main_tokens *= int(extent)
+            if main_tokens <= 0 or main_tokens >= x.shape[1] or _block.self_attn.head_dim != 128:
+                return _stock(
+                    _block, x, e, freqs, context,
+                    context_img_len=context_img_len,
+                    transformer_options=transformer_options,
+                )
+
+            x = x.contiguous()
+            if e.ndim < 4:
+                modulation = (
+                    model_management.cast_to(
+                        _block.modulation, dtype=x.dtype, device=x.device,
+                    ) + e
+                ).chunk(6, dim=1)
+            else:
+                modulation = (
+                    model_management.cast_to(
+                        _block.modulation, dtype=x.dtype, device=x.device,
+                    ).unsqueeze(0) + e
+                ).unbind(2)
+
+            normalized = torch.addcmul(
+                repeat_e(modulation[0], x), _block.norm1(x),
+                1 + repeat_e(modulation[1], x),
+            )
+            attn = _block.self_attn
+            batch, heads, dim = x.shape[0], attn.num_heads, attn.head_dim
+            q = apply_rope1(
+                attn.norm_q(attn.q(normalized[:, :main_tokens])).view(
+                    batch, main_tokens, heads, dim,
+                ),
+                freqs[:, :main_tokens],
+            )
+            k = apply_rope1(
+                attn.norm_k(attn.k(normalized)).view(
+                    batch, x.shape[1], heads, dim,
+                ),
+                freqs,
+            )
+            v = attn.v(normalized).view(batch, x.shape[1], heads, dim)
+            y = four_tile_attention(q, k, v, tensor_layout="NHD")
+            y = attn.o(y.reshape(batch, main_tokens, heads * dim))
+
+            main = x[:, :main_tokens]
+            main = torch.addcmul(main, y, repeat_e(modulation[2], main))
+            del y, q, k, v, normalized
+            main = main + _block.cross_attn(
+                _block.norm3(main), context,
+                context_img_len=context_img_len,
+                transformer_options=transformer_options,
+            )
+            y = _block.ffn(torch.addcmul(
+                repeat_e(modulation[3], main), _block.norm2(main),
+                1 + repeat_e(modulation[4], main),
+            ))
+            main = torch.addcmul(main, y, repeat_e(modulation[5], main))
+            logging.info(
+                "[sol_attn] SCAIL2 final pose active main=%d pose=%d "
+                "(full pose K/V retained)",
+                main_tokens, x.shape[1] - main_tokens,
+            )
+            return torch.cat((main, x[:, main_tokens:]), dim=1)
+
+        patched.add_object_patch(
+            f"diffusion_model.blocks.{len(blocks) - 1}.forward", final_main_only,
+        )
+        logging.info("[sol_attn] installed exact SCAIL2 final pose-query pruning")
+        return io.NodeOutput(patched)
+
+
+class SageAttentionVideoSM89SharedKVPatch(SageAttentionVideoSM89Patch):
+    """Explicit experimental WanAnimate2 rectangular shared-KV specialization."""
+
+    ENABLE_SHARED_KV = True
+    # Refresh the full Sage statistics every four pose frames. This retains
+    # most prefix-quantization savings while bounding rounding drift on fast
+    # motion, where hand/limb artifacts are the most visible failure mode.
+    SHARED_KV_REFRESH_INTERVAL = 4
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SageAttentionVideoSM89SharedKVPatch",
+            display_name="SageAttention Video SM89 Shared KV (Experimental)",
+            category="sol_attn",
+            description="WanAnimate2-only generation-prefix KV cache. Dense SCAIL2 "
+                        "workflows receive only the exact four-tile path.",
+            inputs=[io.Model.Input("model")], outputs=[io.Model.Output()],
+        )
+
+
+class SageAttentionVideoSM89FusedQKPatch(io.ComfyNode):
+    """SCAIL2/Wan dense Sage path with fused Norm/RoPE/INT8 QK frontend."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SageAttentionVideoSM89FusedQKPatch",
+            display_name="SageAttention Video SM89 Fused QK",
+            category="sol_attn",
+            description="Experimental RTX 4090 Wan/SCAIL2 frontend that avoids "
+                        "materialized normalized/RoPE Q and K tensors.",
+            inputs=[io.Model.Input("model")],
+            outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model) -> io.NodeOutput:
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9):
+            raise RuntimeError("SM89 fused QK requires an RTX 4090-class GPU")
+        try:
+            import comfy.model_management as model_management
+            from h3_sage_sm89_backend import attention_prequantized_qk
+            from h3_sage_sm89_backend.wan_fused_frontend import fused_qk_norm_rope_quant
+        except Exception as exc:
+            raise RuntimeError("SM89 fused QK backend is not installed") from exc
+
+        diffusion_model = model.get_model_object("diffusion_model")
+        blocks = getattr(diffusion_model, "blocks", None)
+        if blocks is None:
+            raise RuntimeError("fused QK requires a Wan/SCAIL2 model with transformer blocks")
+        patched = model.clone()
+        installed = 0
+        for index, block in enumerate(blocks):
+            attn = getattr(block, "self_attn", None)
+            # WanAnimate2 owns a different forward_gen lifecycle and uses the
+            # shared-KV path instead. Do not replace that module wholesale.
+            if attn is None or type(attn).__name__ != "WanSelfAttention":
+                continue
+            stock = type(attn).forward
+
+            def fused_forward(x, freqs, transformer_options={}, _attn=attn, _stock=stock):
+                patches = transformer_options.get("patches", {})
+                if "attn1_patch" in patches or x.dtype not in {torch.float16, torch.bfloat16}:
+                    return _stock(_attn, x, freqs, transformer_options=transformer_options)
+                b, s = x.shape[:2]
+                heads, dim = _attn.num_heads, _attn.head_dim
+                if dim != 128 or freqs.ndim != 6:
+                    return _stock(_attn, x, freqs, transformer_options=transformer_options)
+                q_proj = _attn.q(x)
+                k_proj = _attn.k(x)
+                v = _attn.v(x).view(b, s, heads, dim)
+                q_weight = model_management.cast_to(
+                    _attn.norm_q.weight, device=q_proj.device, dtype=q_proj.dtype,
+                )
+                k_weight = model_management.cast_to(
+                    _attn.norm_k.weight, device=k_proj.device, dtype=k_proj.dtype,
+                )
+                qi, qs, ki, ks = fused_qk_norm_rope_quant(
+                    q_proj, k_proj, q_weight, k_weight, freqs,
+                    heads=heads, eps=float(_attn.eps),
+                )
+                out = attention_prequantized_qk(qi, qs, ki, ks, v, tensor_layout="NHD")
+                return _attn.o(out.reshape(b, s, heads * dim))
+
+            patched.add_object_patch(
+                f"diffusion_model.blocks.{index}.self_attn.forward", fused_forward,
+            )
+            installed += 1
+        if not installed:
+            raise RuntimeError("no stock WanSelfAttention modules were eligible for fused QK")
+        logging.info(f"[sol_attn] installed fused Norm/RoPE/Sage-QK on {installed} Wan blocks")
+        return io.NodeOutput(patched)
+
+
+class SageAttentionVideoSM89ExactQPatch(io.ComfyNode):
+    """Quality-gated exact path: native RMSNorm/K, fused Q RoPE->Sage INT8."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="SageAttentionVideoSM89ExactQPatch",
+            display_name="SageAttention Video SM89 Exact Fused Q",
+            category="sol_attn",
+            description="Bit-exact Q frontend for Wan/SCAIL2; K keeps the native "
+                        "mean-centered path to avoid diffusion quality drift.",
+            inputs=[io.Model.Input("model")], outputs=[io.Model.Output()],
+        )
+
+    @classmethod
+    def execute(cls, model) -> io.NodeOutput:
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 9):
+            raise RuntimeError("SM89 exact fused Q requires an RTX 4090-class GPU")
+        try:
+            from comfy.ldm.flux.math import apply_rope1
+            from h3_sage_sm89_backend import attention_prequantized_q
+            from h3_sage_sm89_backend.wan_fused_frontend import fused_q_rope_quant
+        except Exception as exc:
+            raise RuntimeError("SM89 exact fused Q backend is not installed") from exc
+        diffusion_model = model.get_model_object("diffusion_model")
+        blocks = getattr(diffusion_model, "blocks", None)
+        if blocks is None:
+            raise RuntimeError("exact fused Q requires Wan/SCAIL2 transformer blocks")
+        patched = model.clone()
+        installed = 0
+        for index, block in enumerate(blocks):
+            attn = getattr(block, "self_attn", None)
+            if attn is None or type(attn).__name__ != "WanSelfAttention":
+                continue
+            stock = type(attn).forward
+
+            def fused_forward(x, freqs, transformer_options={}, _attn=attn, _stock=stock):
+                patches = transformer_options.get("patches", {})
+                if "attn1_patch" in patches or x.dtype not in {torch.float16, torch.bfloat16}:
+                    return _stock(_attn, x, freqs, transformer_options=transformer_options)
+                b, s = x.shape[:2]
+                heads, dim = _attn.num_heads, _attn.head_dim
+                if dim != 128 or freqs.ndim != 6:
+                    return _stock(_attn, x, freqs, transformer_options=transformer_options)
+                q_norm = _attn.norm_q(_attn.q(x))
+                qi, qs = fused_q_rope_quant(q_norm, freqs, heads=heads)
+                del q_norm
+                k = apply_rope1(
+                    _attn.norm_k(_attn.k(x)).view(b, s, heads, dim), freqs,
+                )
+                v = _attn.v(x).view(b, s, heads, dim)
+                out = attention_prequantized_q(qi, qs, k, v, tensor_layout="NHD")
+                return _attn.o(out.reshape(b, s, heads * dim))
+
+            patched.add_object_patch(
+                f"diffusion_model.blocks.{index}.self_attn.forward", fused_forward,
+            )
+            installed += 1
+        if not installed:
+            raise RuntimeError("no stock WanSelfAttention modules were eligible for exact fused Q")
+        logging.info(f"[sol_attn] installed exact fused Q frontend on {installed} Wan blocks")
         return io.NodeOutput(patched)
 
 
@@ -1088,7 +1487,11 @@ if os.environ.get("SOL_ATTN", "0") not in ("0", "", "false"):
 class SolAttnVideoExtension(ComfyExtension):
     async def get_node_list(self):
         return [SolAttnVideoPatch, SolAttnVideoBlockProbe,
-                SolAttnVideoSoftCleanup, SageAttentionVideoSM89Patch]
+                SolAttnVideoSoftCleanup, SageAttentionVideoSM89Patch,
+                SCAIL2VideoFinalPoseQueryPrune,
+                SageAttentionVideoSM89SharedKVPatch,
+                SageAttentionVideoSM89FusedQKPatch,
+                SageAttentionVideoSM89ExactQPatch]
 
 
 async def comfy_entrypoint() -> SolAttnVideoExtension:
