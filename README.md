@@ -1,5 +1,10 @@
 # ComfyUI-SolAttn_triton-video
 
+中文文档：
+
+- [RTX 4090 中文安装指南](docs/INSTALL_RTX4090_ZH.md)
+- [SCAIL2 加速实现与测试记录](docs/SCAIL2_81x76_ACCELERATION_ZH.md)
+
 Video-oriented Sol-Attn Triton nodes for long Wan/MiniMax-H3/SCAIL2 sequences.
 
 This package is separate from upstream `ComfyUI-SolAttn_triton` and exposes
