@@ -67,21 +67,28 @@ git -C "$NODE_ROOT" checkout e35e4e5
 ## 3. 安装 SM89 CUDA backend
 
 Four-Tile 依赖 `h3_sage_sm89_backend`。它是 Python/CUDA 二进制扩展，不是
-ComfyUI 节点，也不会随本仓库自动安装。
+ComfyUI 节点。仓库包含已验证生产环境使用的预编译 wheel，但为避免擅自改变
+Python 环境，克隆仓库时不会自动安装，必须显式执行下面的命令。
 
-### 推荐：安装匹配环境的 wheel
+### 推荐：安装仓库附带的生产 wheel
 
-从私有制品库取得与目标环境完全匹配的 wheel，然后使用 ComfyUI Python 安装：
+该 wheel 对应 Python 3.12、Linux x86_64、PyTorch `2.9.1+cu130`、CUDA 13.0
+和 SM89。先校验文件，再使用 ComfyUI Python 安装：
 
 ```bash
+COMFY_ROOT=/root/lisiyuan/ComfyUI
 COMFY_PYTHON=/root/lisiyuan/miniforge3/envs/comfyui/bin/python
-BACKEND_WHEEL=/绝对路径/h3_sage_sm89_backend-0.1.0-cp312-cp312-linux_x86_64.whl
+NODE_ROOT="$COMFY_ROOT/custom_nodes/ComfyUI-SolAttn_triton-video"
+BACKEND_WHEEL="$NODE_ROOT/wheels/h3_sage_sm89_backend-0.1.0-cp312-cp312-linux_x86_64.whl"
 
+echo "e8cc779d8c8827c8eb0aa0bd2f1114a0e0d48979e1815c644f936af9a950e9bc  $BACKEND_WHEEL" \
+  | sha256sum -c -
 "$COMFY_PYTHON" -m pip install --no-deps --force-reinstall "$BACKEND_WHEEL"
 ```
 
-文件名只能提示 Python ABI；仍需确认该 wheel 对应目标 PyTorch 和 CUDA 版本。
-公开仓库不包含核心 CUDA 源码，这是为了避免公开生产 kernel 的实现细节。
+如果目标环境与上述版本不同，不要强行安装这个 wheel。文件名只能提示 Python ABI，
+无法表达 PyTorch 和 CUDA ABI。公开仓库提供生产二进制，但不包含核心 CUDA 源码，
+以避免公开 kernel 实现细节。
 
 ### 有授权源码时本机编译
 

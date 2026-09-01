@@ -23,8 +23,10 @@ The production SCAIL2 chain is self-contained at the ComfyUI-node level:
 
 The SCAIL2 production workflow does **not** require the experimental
 `ComfyUI-SCAIL2-KitchenW4A4` package. It does require the separately compiled
-`h3_sage_sm89_backend` Python/CUDA extension. Installing this repository alone
-does not install that binary backend.
+`h3_sage_sm89_backend` Python/CUDA extension. A validated RTX 4090 binary wheel
+is included under [`wheels/`](wheels/); it must be installed explicitly with
+ComfyUI's Python. See the Chinese installation guide for the exact command and
+ABI restrictions.
 
 ## RTX 4090 production requirements
 
@@ -32,8 +34,8 @@ does not install that binary backend.
 - the exact PyTorch/CUDA ABI used to build `h3_sage_sm89_backend`;
 - Triton compatible with that PyTorch installation;
 - a persistent writable Triton and CUDA cache directory;
-- the `h3_sage_sm89_backend` wheel built for the production Python, PyTorch,
-  CUDA and Linux ABI.
+- the bundled `h3_sage_sm89_backend` wheel, or a wheel rebuilt for the target
+  Python, PyTorch, CUDA and Linux ABI.
 
 The validated machine currently uses Python 3.12, PyTorch `2.9.1+cu130`,
 Triton `3.5.1`, and an SM89-only backend build. Do not copy the compiled `.so`
