@@ -33,9 +33,10 @@ PY
 nvcc --version
 ```
 
-已验证的生产环境是 Python 3.12、PyTorch `2.9.1+cu130`、Triton
-`3.5.1` 和 RTX 4090。其他版本不代表一定不能运行，但 CUDA 扩展必须按
-目标机的 Python、PyTorch、CUDA ABI 重新构建，不能跨环境复制 `.so`。
+已提供并验证 Python 3.10、3.11、3.12 三个 ABI 的 wheel；目标环境均为
+PyTorch `2.9.1+cu130`、Triton `3.5.1`、Linux x86_64 和 RTX 4090/SM89。
+其他版本不代表一定不能运行，但 CUDA 扩展必须按目标机的 Python、PyTorch、
+CUDA ABI 重新构建，不能跨环境复制 `.so`。
 
 ## 2. 安装 ComfyUI 节点
 
@@ -72,23 +73,28 @@ Python 环境，克隆仓库时不会自动安装，必须显式执行下面的�
 
 ### 推荐：安装仓库附带的生产 wheel
 
-该 wheel 对应 Python 3.12、Linux x86_64、PyTorch `2.9.1+cu130`、CUDA 13.0
-和 SM89。先校验文件，再使用 ComfyUI Python 安装：
+仓库提供 Python 3.10、3.11、3.12 三个 wheel，包含相同版本的优化 kernel。
+安装脚本会根据 ComfyUI Python 自动选择。先校验全部文件，再安装匹配版本：
 
 ```bash
 COMFY_ROOT=/root/lisiyuan/ComfyUI
 COMFY_PYTHON=/root/lisiyuan/miniforge3/envs/comfyui/bin/python
 NODE_ROOT="$COMFY_ROOT/custom_nodes/ComfyUI-SolAttn_triton-video"
-BACKEND_WHEEL="$NODE_ROOT/wheels/h3_sage_sm89_backend-0.1.0-cp312-cp312-linux_x86_64.whl"
 
-echo "e8cc779d8c8827c8eb0aa0bd2f1114a0e0d48979e1815c644f936af9a950e9bc  $BACKEND_WHEEL" \
-  | sha256sum -c -
+PY_TAG=$("$COMFY_PYTHON" -c \
+  'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+case "$PY_TAG" in cp310|cp311|cp312) ;; *)
+  echo "仓库没有适用于 $PY_TAG 的 wheel" >&2; exit 1;;
+esac
+
+BACKEND_WHEEL="$NODE_ROOT/wheels/h3_sage_sm89_backend-0.1.0-${PY_TAG}-${PY_TAG}-linux_x86_64.whl"
+(cd "$NODE_ROOT/wheels" && sha256sum -c SHA256SUMS)
 "$COMFY_PYTHON" -m pip install --no-deps --force-reinstall "$BACKEND_WHEEL"
 ```
 
-如果目标环境与上述版本不同，不要强行安装这个 wheel。文件名只能提示 Python ABI，
-无法表达 PyTorch 和 CUDA ABI。公开仓库提供生产二进制，但不包含核心 CUDA 源码，
-以避免公开 kernel 实现细节。
+如果目标 PyTorch、CUDA 主版本或平台与上述矩阵不同，不要强行安装。文件名只能提示
+Python ABI，无法表达 PyTorch 和 CUDA ABI。公开仓库提供生产二进制，但不包含核心
+CUDA 源码，以避免公开 kernel 实现细节。
 
 ### 有授权源码时本机编译
 

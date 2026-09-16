@@ -25,8 +25,71 @@ The SCAIL2 production workflow does **not** require the experimental
 `ComfyUI-SCAIL2-KitchenW4A4` package. It does require the separately compiled
 `h3_sage_sm89_backend` Python/CUDA extension. A validated RTX 4090 binary wheel
 is included under [`wheels/`](wheels/); it must be installed explicitly with
-ComfyUI's Python. See the Chinese installation guide for the exact command and
-ABI restrictions.
+ComfyUI's Python.
+
+## Installation / 安装
+
+The prebuilt backend targets Linux x86_64, RTX 4090/SM89, PyTorch
+`2.9.1+cu130`, Triton `3.5.1`, and Python 3.10–3.12. It contains the same
+optimized kernel revision for all three Python ABIs.
+
+| ComfyUI Python | Bundled wheel |
+|---|---|
+| 3.10 | `h3_sage_sm89_backend-0.1.0-cp310-cp310-linux_x86_64.whl` |
+| 3.11 | `h3_sage_sm89_backend-0.1.0-cp311-cp311-linux_x86_64.whl` |
+| 3.12 | `h3_sage_sm89_backend-0.1.0-cp312-cp312-linux_x86_64.whl` |
+
+Clone the node into `custom_nodes`, then install the wheel selected from the
+Python interpreter that actually starts ComfyUI:
+
+```bash
+COMFY_ROOT=/path/to/ComfyUI
+COMFY_PYTHON=/path/to/comfyui/python
+NODE_ROOT="$COMFY_ROOT/custom_nodes/ComfyUI-SolAttn_triton-video"
+
+git clone https://github.com/GuardSkill/ComfyUI-SolAttn_triton-video.git \
+  "$NODE_ROOT"
+
+PY_TAG=$("$COMFY_PYTHON" -c \
+  'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')
+case "$PY_TAG" in cp310|cp311|cp312) ;; *)
+  echo "No bundled wheel for $PY_TAG" >&2; exit 1;;
+esac
+
+BACKEND_WHEEL="$NODE_ROOT/wheels/h3_sage_sm89_backend-0.1.0-${PY_TAG}-${PY_TAG}-linux_x86_64.whl"
+(cd "$NODE_ROOT/wheels" && sha256sum -c SHA256SUMS)
+"$COMFY_PYTHON" -m pip install --no-deps --force-reinstall "$BACKEND_WHEEL"
+```
+
+Do not run the install command with a system `pip`; use ComfyUI's Python.
+`--no-deps` intentionally prevents the wheel from replacing the working
+PyTorch/CUDA stack. SageAttention must already be installed in that same
+environment.
+
+Restart ComfyUI completely, then verify the binary backend:
+
+```bash
+"$COMFY_PYTHON" - <<'PY'
+import torch, triton, h3_sage_sm89_backend
+print("torch:", torch.__version__, "cuda:", torch.version.cuda)
+print("triton:", triton.__version__)
+print("gpu:", torch.cuda.get_device_name())
+print("capability:", torch.cuda.get_device_capability())
+assert torch.cuda.get_device_capability() == (8, 9)
+assert callable(h3_sage_sm89_backend.attention)
+print("SM89 backend OK")
+PY
+```
+
+The production workflow should expose these nodes after restart:
+
+- `SageAttentionVideoSM89Patch`
+- `SCAIL2VideoFinalPoseQueryPrune`
+- `SolAttnVideoSoftCleanup`
+
+For a safe in-place upgrade, persistent kernel caches, `/object_info`
+validation, and troubleshooting, read the
+[Chinese RTX 4090 installation guide](docs/INSTALL_RTX4090_ZH.md).
 
 ## RTX 4090 production requirements
 
@@ -37,10 +100,10 @@ ABI restrictions.
 - the bundled `h3_sage_sm89_backend` wheel, or a wheel rebuilt for the target
   Python, PyTorch, CUDA and Linux ABI.
 
-The validated machine currently uses Python 3.12, PyTorch `2.9.1+cu130`,
-Triton `3.5.1`, and an SM89-only backend build. Do not copy the compiled `.so`
-to a machine with a different Python/PyTorch/CUDA ABI. Build or install a
-matching wheel instead.
+The validated wheel matrix uses Python 3.10, 3.11, and 3.12 with PyTorch
+`2.9.1+cu130`, Triton `3.5.1`, and an SM89-only backend build. Do not copy the
+compiled `.so` to a different Python/PyTorch/CUDA ABI. Install the matching
+wheel instead.
 
 For production upgrades, deploy a clean tagged checkout beside the active
 directory, install the matching backend wheel with ComfyUI's own Python, start
